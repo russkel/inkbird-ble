@@ -14,6 +14,7 @@ from bluetooth_data_tools import monotonic_time_coarse
 from bluetooth_sensor_state_data import DeviceClass, SensorUpdate
 from habluetooth import BluetoothServiceInfoBleak
 from sensor_state_data import (
+    BinarySensorDeviceClass,
     DeviceKey,
     SensorDescription,
     SensorDeviceClass,
@@ -4367,20 +4368,23 @@ async def test_int_11i_b_poll() -> None:
             side_effect=[
                 b"\x2d\x1c\x16",
                 b"\x64\x64\x00\x00\x00",
+                b"\x01",
                 b"\xfe\x7f\x16",
                 b"\x59\x64\x00\x00\x00",
+                b"\x03",
                 b"\xff\x1e\x1d",
                 b"\x59\x64\x00\x00\x00",
+                b"\x01",
             ]
         ),
         disconnect=AsyncMock(),
     )
     ble_device = BLEDevice(address="A4:C1:38:C9:88:65", name="INT-11I-B", details={})
     with patch("inkbird_ble.parser.establish_connection", return_value=mock_client):
-        for temperature, station_battery, probe_battery in (
-            (22.3, 100, 100),
-            (None, 89, 100),
-            (26.3, 89, 100),
+        for temperature, station_battery, probe_battery, charging in (
+            (22.3, 100, 100, False),
+            (None, 89, 100, True),
+            (26.3, 89, 100, False),
         ):
             update = await parser.async_poll(ble_device)
             values = {
@@ -4393,6 +4397,8 @@ async def test_int_11i_b_poll() -> None:
                 "station_battery": station_battery,
                 "probe_battery": probe_battery,
             }
+            probe_charging = update.binary_entity_values[DeviceKey("probe_charging")]
+            assert probe_charging.native_value is charging
 
 
 @pytest.mark.asyncio
@@ -4416,6 +4422,8 @@ async def test_int_11i_b_poll_temperature_only_without_battery_char() -> None:
     assert "temperature" in keys
     assert "station_battery" not in keys
     assert "probe_battery" not in keys
+    # Without a battery read the status byte has no fixed slot, so it is skipped.
+    assert DeviceKey("probe_charging") not in update.binary_entity_values
 
 
 @pytest.mark.asyncio
@@ -4446,7 +4454,7 @@ async def test_int_11i_b_poll_impossible_battery_skipped() -> None:
     parser = INKBIRDBluetoothDeviceData(Model.INT_11I_B)
     parser.update(_int_11i_b_service_info(b""))
     # station battery 0xFF -> 255% impossible; probe 75% valid.
-    read_gatt_char_mock = AsyncMock(side_effect=[b"\x60\x1d", b"\xff\x4b"])
+    read_gatt_char_mock = AsyncMock(side_effect=[b"\x60\x1d", b"\xff\x4b", b"\x01"])
     mock_client = MagicMock(read_gatt_char=read_gatt_char_mock, disconnect=AsyncMock())
     with patch("inkbird_ble.parser.establish_connection", return_value=mock_client):
         update = await parser.async_poll(
@@ -4471,7 +4479,7 @@ async def test_int_11i_b_poll_impossible_probe_battery_skipped() -> None:
     parser = INKBIRDBluetoothDeviceData(Model.INT_11I_B)
     parser.update(_int_11i_b_service_info(b""))
     # station 80% valid; probe battery 0xFF -> 255% impossible.
-    read_gatt_char_mock = AsyncMock(side_effect=[b"\x60\x1d", b"\x50\xff"])
+    read_gatt_char_mock = AsyncMock(side_effect=[b"\x60\x1d", b"\x50\xff", b"\x01"])
     mock_client = MagicMock(read_gatt_char=read_gatt_char_mock, disconnect=AsyncMock())
     with patch("inkbird_ble.parser.establish_connection", return_value=mock_client):
         update = await parser.async_poll(
@@ -4670,7 +4678,7 @@ async def test_int_11i_b_unusable_advertisement_preserves_poll(
     parser.update(_int_11i_b_service_info(_INT_11I_B_WARMING, 51409))
     mock_client = MagicMock(
         read_gatt_char=AsyncMock(
-            side_effect=[b"\xff\x1e\x1d", b"\x59\x64\x00\x00\x00"]
+            side_effect=[b"\xff\x1e\x1d", b"\x59\x64\x00\x00\x00", b"\x01"]
         ),
         disconnect=AsyncMock(),
     )
@@ -4701,7 +4709,7 @@ async def test_int_11i_b_unusable_advertisement_during_poll_keeps_gatt(
     service_info = _int_11i_b_service_info(_INT_11I_B_WARMING, 51409, raw=raw)
     service_info.manufacturer_data.clear()
     service_info.manufacturer_data.update(manufacturer_data)
-    responses = iter([b"\xff\x1e\x1d", b"\x59\x64\x00\x00\x00"])
+    responses = iter([b"\xff\x1e\x1d", b"\x59\x64\x00\x00\x00", b"\x01"])
 
     async def read_characteristic(_characteristic: object) -> bytes:
         parser.update(service_info)
@@ -4734,7 +4742,7 @@ async def test_int_11i_b_advertisement_during_poll_takes_precedence(
     """A docking advertisement wins over an older GATT response in flight."""
     parser = INKBIRDBluetoothDeviceData(Model.INT_11I_B)
     parser.update(_int_11i_b_service_info(b""))
-    responses = iter([b"\xff\x1e\x1d", b"\x59\x64\x00\x00\x00"])
+    responses = iter([b"\xff\x1e\x1d", b"\x59\x64\x00\x00\x00", b"\x01"])
 
     async def read_characteristic(_characteristic: object) -> bytes:
         parser.update(_int_11i_b_service_info(_INT_11I_B_DOCKED, 51409, raw=raw))
@@ -4751,6 +4759,99 @@ async def test_int_11i_b_advertisement_during_poll_takes_precedence(
     assert update.entity_values[DeviceKey("temperature", None)].native_value is None
     assert update.entity_values[DeviceKey("station_battery", None)].native_value == 91
     assert update.entity_values[DeviceKey("probe_battery", None)].native_value == 60
+
+
+@pytest.mark.asyncio
+async def test_int_11i_b_poll_docked_probe_charging() -> None:
+    """The ff03 dock flag (byte 0 bit 1) reports a docked probe as charging.
+
+    Captured from hardware with the probe in its charging cradle: ff01
+    ``fe7f16`` (inactive marker) and ff03 ``03...``.
+    """
+    parser = INKBIRDBluetoothDeviceData(Model.INT_11I_B)
+    parser.update(_int_11i_b_service_info(b""))
+    read_gatt_char_mock = AsyncMock(
+        side_effect=[
+            bytes.fromhex("fe7f16"),
+            bytes.fromhex("6364000000"),
+            bytes.fromhex("0310400400000000000000"),
+        ]
+    )
+    mock_client = MagicMock(read_gatt_char=read_gatt_char_mock, disconnect=AsyncMock())
+    with patch("inkbird_ble.parser.establish_connection", return_value=mock_client):
+        update = await parser.async_poll(
+            BLEDevice(address="A4:C1:38:C9:88:65", name="INT-11I-B", details={})
+        )
+    assert update.entity_values[DeviceKey("temperature", None)].native_value is None
+    assert update.entity_values[DeviceKey("station_battery", None)].native_value == 99
+    assert update.entity_values[DeviceKey("probe_battery", None)].native_value == 100
+    charging = update.binary_entity_values[DeviceKey("probe_charging")]
+    assert charging.native_value is True
+    assert charging.name == "Probe Charging"
+    description = update.binary_entity_descriptions[DeviceKey("probe_charging")]
+    assert description.device_class is BinarySensorDeviceClass.BATTERY_CHARGING
+
+
+@pytest.mark.asyncio
+async def test_int_11i_b_poll_undocked_probe_not_charging() -> None:
+    """Out of the cradle the ff03 dock flag is clear and temperature is live.
+
+    Captured from hardware with the probe removed from its cradle:
+    ff01 ``d81b17`` -> 7128 -> 71.28F -> 21.8C; ff03 byte 0 ``0x01``.
+    """
+    parser = INKBIRDBluetoothDeviceData(Model.INT_11I_B)
+    parser.update(_int_11i_b_service_info(b""))
+    read_gatt_char_mock = AsyncMock(
+        side_effect=[
+            bytes.fromhex("d81b17"),
+            bytes.fromhex("6364000000"),
+            bytes.fromhex("0110400400000000000000"),
+        ]
+    )
+    mock_client = MagicMock(read_gatt_char=read_gatt_char_mock, disconnect=AsyncMock())
+    with patch("inkbird_ble.parser.establish_connection", return_value=mock_client):
+        update = await parser.async_poll(
+            BLEDevice(address="A4:C1:38:C9:88:65", name="INT-11I-B", details={})
+        )
+    assert update.entity_values[DeviceKey("temperature", None)].native_value == 21.8
+    charging = update.binary_entity_values[DeviceKey("probe_charging")]
+    assert charging.native_value is False
+
+
+@pytest.mark.asyncio
+async def test_int_11i_b_poll_without_status_char() -> None:
+    """A missing ff03 characteristic still yields temperature and batteries."""
+    parser = INKBIRDBluetoothDeviceData(Model.INT_11I_B)
+    parser.update(_int_11i_b_service_info(b""))
+    mock_service = MagicMock()
+    mock_service.get_characteristic.side_effect = lambda uuid: (
+        None if str(uuid).startswith("0000ff03") else MagicMock()
+    )
+    mock_client = MagicMock(disconnect=AsyncMock())
+    mock_client.services.get_service.return_value = mock_service
+    mock_client.read_gatt_char = AsyncMock(side_effect=[b"\x60\x1d", b"\x50\x4b"])
+    with patch("inkbird_ble.parser.establish_connection", return_value=mock_client):
+        update = await parser.async_poll(
+            BLEDevice(address="A4:C1:38:C9:88:65", name="INT-11I-B", details={})
+        )
+    assert update.entity_values[DeviceKey("temperature", None)].native_value == 24.0
+    assert update.entity_values[DeviceKey("station_battery", None)].native_value == 80
+    assert update.entity_values[DeviceKey("probe_battery", None)].native_value == 75
+    assert DeviceKey("probe_charging") not in update.binary_entity_values
+
+
+@pytest.mark.asyncio
+async def test_int_11i_b_poll_empty_status_read() -> None:
+    """An empty ff03 read emits no charging state."""
+    parser = INKBIRDBluetoothDeviceData(Model.INT_11I_B)
+    parser.update(_int_11i_b_service_info(b""))
+    read_gatt_char_mock = AsyncMock(side_effect=[b"\x60\x1d", b"\x50\x4b", b""])
+    mock_client = MagicMock(read_gatt_char=read_gatt_char_mock, disconnect=AsyncMock())
+    with patch("inkbird_ble.parser.establish_connection", return_value=mock_client):
+        update = await parser.async_poll(
+            BLEDevice(address="A4:C1:38:C9:88:65", name="INT-11I-B", details={})
+        )
+    assert DeviceKey("probe_charging") not in update.binary_entity_values
 
 
 @pytest.mark.asyncio

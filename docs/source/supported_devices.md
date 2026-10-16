@@ -18,7 +18,7 @@ must supply it (notify-only devices).
 | `IAM-T2`                | Indoor air quality      | advertisement      | 17-byte payload + MAC prefix       | temperature, humidity, CO₂                                                     |
 | `IHT-2PB`               | 3-probe thermometer     | GATT notify        | local name `Ink@IHT-2PB#…`         | temperature × 3 probes                                                         |
 | `INT-11P-B`             | Connected BBQ probe     | GATT poll          | local name `int-11p-b`             | probe temperature, ambient temperature, probe battery, case battery            |
-| `INT-11I-B`             | Connected probe         | advertisement/GATT | local name `int-11i-b`             | temperature, station battery, probe battery                                    |
+| `INT-11I-B`             | Connected probe         | advertisement/GATT | local name `int-11i-b`             | temperature, station battery, probe battery, probe charging (docked)           |
 | `iBBQ-1`                | BBQ probe (1 channel)   | advertisement      | name contains `xbbq` / `ibbq`      | temperature × 1                                                                |
 | `iBBQ-2`                | BBQ probe (2 channel)   | advertisement      | name contains `xbbq` / `ibbq`      | temperature × 2                                                                |
 | `iBBQ-4`                | BBQ probe (4 channel)   | advertisement      | name contains `xbbq` / `ibbq`      | temperature × 4                                                                |
@@ -56,6 +56,8 @@ temperature, station battery, and probe battery sensors. The `0x7FFE` inactive
 probe marker clears temperature to `None` without clearing the battery readings.
 A usable advertisement received during a GATT poll takes precedence over that
 poll's response.
+Probe charging is only available over GATT: bit 1 of `ff03` byte 0 is set
+while the probe sits in its cradle, where it charges from the base station.
 
 The advertisement layout is based on captures while warming and docking a probe,
 with the unequal battery levels checked against the INKBIRD app. Offsets below

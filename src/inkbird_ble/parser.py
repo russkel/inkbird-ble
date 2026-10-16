@@ -26,7 +26,7 @@ from bluetooth_data_tools import (
     short_address,
 )
 from bluetooth_sensor_state_data import BluetoothData, SensorUpdate
-from sensor_state_data import SensorLibrary, Units
+from sensor_state_data import BinarySensorDeviceClass, SensorLibrary, Units
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine, Iterable
@@ -200,6 +200,12 @@ INT_11I_B_ADV_PROBE_BATTERY_INDEX = 13
 INT_11I_B_ADV_STATION_BATTERY_INDEX = 15
 INT_11I_B_MIN_TEMPERATURE_CELSIUS = -10
 INT_11I_B_MAX_TEMPERATURE_CELSIUS = 100
+# ff03 byte 0 bit 1 is set while the probe sits in its cradle, where it charges
+# from the base station: 0x03 docked vs 0x01 undocked, confirmed on hardware
+# across dock/undock cycles. The byte is appended after the battery bytes.
+INT_11I_B_STATUS_CHARACTERISTIC_UUID = UUID("0000ff03-0000-1000-8000-00805f9b34fb")
+INT_11I_B_STATUS_INDEX = 4
+INT_11I_B_DOCKED_FLAG = 0x02
 
 # IDT-34c-B notify support. This 6-probe BBQ thermometer (a Tuya-based device,
 # MAC prefix A4:C1:38) carries no readings in its advertisement — it only
@@ -1187,6 +1193,10 @@ class INKBIRDBluetoothDeviceData(BluetoothData):
         buffer — temperature first (2 bytes), then battery (2 bytes) — so the
         existing ``async_poll`` short-read guards still apply. The battery
         characteristic is optional: if it is absent we return temperature only.
+        When the battery read is complete, the first byte of the ``ff03``
+        status characteristic (dock flag) is appended at
+        ``INT_11I_B_STATUS_INDEX``; it is skipped otherwise, as it would have
+        no fixed slot.
         """
         temp_char = service.get_characteristic(INT_11I_B_TEMP_CHARACTERISTIC_UUID)
         temperature = await client.read_gatt_char(temp_char)
@@ -1198,7 +1208,14 @@ class INKBIRDBluetoothDeviceData(BluetoothData):
         batt_char = service.get_characteristic(INT_11I_B_BATTERY_CHARACTERISTIC_UUID)
         if batt_char is not None:
             battery = await client.read_gatt_char(batt_char)
-        return bytes(temperature[:2]) + bytes(battery[:2])
+        payload = bytes(temperature[:2]) + bytes(battery[:2])
+        if len(payload) < INT_11I_B_FULL_READ_LEN:
+            return payload
+        status = b""
+        status_char = service.get_characteristic(INT_11I_B_STATUS_CHARACTERISTIC_UUID)
+        if status_char is not None:
+            status = await client.read_gatt_char(status_char)
+        return payload + bytes(status[:1])
 
     def _poll_read_too_short(self, payload: bytes, minimum: int) -> bool:
         """Return ``True`` (and log) when a GATT poll read is undersized.
@@ -1580,7 +1597,8 @@ class INKBIRDBluetoothDeviceData(BluetoothData):
         """Update the sensor values for an INT-11I-B GATT read.
 
         ``payload`` is the temperature read (``ff01``) followed by the optional
-        battery read (``2a19``), concatenated by ``_async_read_int_11i_b``. The
+        battery read (``2a19``) and ``ff03`` status byte, concatenated by
+        ``_async_read_int_11i_b``. The
         decode follows the working community ESPHome config from issue #238:
         the temperature is a little-endian uint16 of Fahrenheit x 100, and the
         battery characteristic carries the base-station and probe percentages.
@@ -1605,6 +1623,13 @@ class INKBIRDBluetoothDeviceData(BluetoothData):
             payload[INT_11I_B_STATION_BATTERY_INDEX],
             payload[INT_11I_B_PROBE_BATTERY_INDEX],
         )
+        if len(payload) > INT_11I_B_STATUS_INDEX:
+            self.update_predefined_binary_sensor(
+                BinarySensorDeviceClass.BATTERY_CHARGING,
+                bool(payload[INT_11I_B_STATUS_INDEX] & INT_11I_B_DOCKED_FLAG),
+                key="probe_charging",
+                name="Probe Charging",
+            )
 
     _device_type_dispatch: ClassVar[
         dict[Model, Callable[[INKBIRDBluetoothDeviceData, bytes, int], None]]
