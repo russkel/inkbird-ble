@@ -4346,7 +4346,8 @@ def test_int_11i_b_detected_from_advertisement(
     assert parser.supported(service_info) is True
     assert parser.name == "INT-11I-B 8865"
     assert parser.uses_notify is False
-    assert parser.poll_needed(service_info, None) is False
+    # Probe charging is GATT-only, so a valid advertisement still needs a poll.
+    assert parser.poll_needed(service_info, None) is True
     values = {
         key.key: value.native_value for key, value in update.entity_values.items()
     }
@@ -4528,7 +4529,8 @@ def test_int_11i_b_advertisement_temperature_boundaries(
     assert (
         update.entity_values[DeviceKey("temperature", None)].native_value == temperature
     )
-    assert parser.poll_needed(service_info, None) is False
+    # Probe charging is GATT-only, so a valid advertisement still needs a poll.
+    assert parser.poll_needed(service_info, None) is True
 
 
 @pytest.mark.parametrize(
@@ -4568,48 +4570,41 @@ def test_int_11i_b_invalid_advertisement_ignored(payload: bytes) -> None:
 
 
 @pytest.mark.parametrize(
-    ("manufacturer_data", "raw", "age", "needed"),
+    ("manufacturer_data", "raw", "age"),
     [
-        pytest.param({51409: _INT_11I_B_WARMING}, None, 0.0, False, id="fresh"),
-        pytest.param({51409: _INT_11I_B_DOCKED}, None, 0.0, False, id="inactive"),
-        pytest.param(
-            {51409: _INT_11I_B_WARMING}, None, 330.0, False, id="freshness-boundary"
-        ),
-        pytest.param({51409: _INT_11I_B_WARMING}, None, 331.0, True, id="stale"),
-        pytest.param({}, None, 0.0, True, id="discovery-only"),
+        pytest.param({51409: _INT_11I_B_WARMING}, None, 0.0, id="fresh"),
+        pytest.param({51409: _INT_11I_B_DOCKED}, None, 0.0, id="inactive"),
+        pytest.param({51409: _INT_11I_B_WARMING}, None, 330.0, id="freshness-boundary"),
+        pytest.param({51409: _INT_11I_B_WARMING}, None, 331.0, id="stale"),
+        pytest.param({}, None, 0.0, id="discovery-only"),
         pytest.param(
             {51409: b"\x00"},
             b"\x13\xff\xd1\xc8" + _INT_11I_B_WARMING,
             0.0,
-            False,
             id="raw-valid",
         ),
         pytest.param(
             {51409: _INT_11I_B_WARMING},
             b"\x04\xff\xd1\xc8\x00",
             0.0,
-            True,
             id="raw-invalid",
         ),
         pytest.param(
             {51409: _INT_11I_B_WARMING, 51410: _INT_11I_B_DOCKED},
             None,
             0.0,
-            True,
             id="ambiguous-merged",
         ),
         pytest.param(
             {51409: _INT_11I_B_WARMING, 51410: _INT_11I_B_DOCKED},
             b"",
             0.0,
-            True,
             id="empty-raw",
         ),
         pytest.param(
             {51409: _INT_11I_B_WARMING, 2: b"\x10"},
             None,
             0.0,
-            False,
             id="apple-excluded",
         ),
     ],
@@ -4618,22 +4613,26 @@ def test_int_11i_b_advertisement_polling_policy(
     manufacturer_data: dict[int, bytes],
     raw: bytes | None,
     age: float,
-    needed: bool,
 ) -> None:
-    """Use the current packet's readings and freshness with bounded GATT polls."""
+    """Poll on the minimum interval whatever the advertisement carries.
+
+    Advertisements update temperature and batteries in between, but probe
+    charging is only readable over GATT, so neither a fresh valid advertisement
+    nor a stale or unusable one changes the interval poll.
+    """
     parser = INKBIRDBluetoothDeviceData(Model.INT_11I_B)
     with patch(f"{__name__}.monotonic_time_coarse", return_value=1000.0 - age):
         service_info = _int_11i_b_service_info(raw=raw)
     service_info.manufacturer_data.clear()
     service_info.manufacturer_data.update(manufacturer_data)
     with patch("inkbird_ble.parser.monotonic_time_coarse", return_value=1000.0):
-        assert parser.poll_needed(service_info, None) is needed
+        assert parser.poll_needed(service_info, None) is True
         assert parser.poll_needed(service_info, 330.0) is False
-        assert parser.poll_needed(service_info, 331.0) is needed
+        assert parser.poll_needed(service_info, 331.0) is True
 
 
-def test_int_11i_b_identical_fresh_advertisement_avoids_poll() -> None:
-    """Deduplicated readings still use the current packet's freshness."""
+def test_int_11i_b_identical_fresh_advertisement_still_polls_on_interval() -> None:
+    """Fresh deduplicated readings do not suppress the GATT charging poll."""
     parser = INKBIRDBluetoothDeviceData()
     with patch(f"{__name__}.monotonic_time_coarse", return_value=500.0):
         parser.update(_int_11i_b_service_info(_INT_11I_B_WARMING))
@@ -4641,7 +4640,8 @@ def test_int_11i_b_identical_fresh_advertisement_avoids_poll() -> None:
         service_info = _int_11i_b_service_info(_INT_11I_B_WARMING)
         parser.update(service_info)
     with patch("inkbird_ble.parser.monotonic_time_coarse", return_value=1000.0):
-        assert parser.poll_needed(service_info, None) is False
+        assert parser.poll_needed(service_info, None) is True
+        assert parser.poll_needed(service_info, 330.0) is False
 
 
 @pytest.mark.parametrize(
@@ -4663,7 +4663,8 @@ def test_int_11i_b_raw_advertisement_overrides_merged_data(
     assert update.entity_values[DeviceKey("temperature", None)].native_value is None
     assert update.entity_values[DeviceKey("station_battery", None)].native_value == 91
     assert update.entity_values[DeviceKey("probe_battery", None)].native_value == 60
-    assert parser.poll_needed(service_info, None) is False
+    # Probe charging is GATT-only, so a valid advertisement still needs a poll.
+    assert parser.poll_needed(service_info, None) is True
 
 
 @pytest.mark.parametrize(
@@ -4742,7 +4743,7 @@ async def test_int_11i_b_advertisement_during_poll_takes_precedence(
     """A docking advertisement wins over an older GATT response in flight."""
     parser = INKBIRDBluetoothDeviceData(Model.INT_11I_B)
     parser.update(_int_11i_b_service_info(b""))
-    responses = iter([b"\xff\x1e\x1d", b"\x59\x64\x00\x00\x00", b"\x01"])
+    responses = iter([b"\xff\x1e\x1d", b"\x59\x64\x00\x00\x00", b"\x03"])
 
     async def read_characteristic(_characteristic: object) -> bytes:
         parser.update(_int_11i_b_service_info(_INT_11I_B_DOCKED, 51409, raw=raw))
@@ -4759,6 +4760,9 @@ async def test_int_11i_b_advertisement_during_poll_takes_precedence(
     assert update.entity_values[DeviceKey("temperature", None)].native_value is None
     assert update.entity_values[DeviceKey("station_battery", None)].native_value == 91
     assert update.entity_values[DeviceKey("probe_battery", None)].native_value == 60
+    # Advertisements carry no charging state, so the poll's ff03 still applies.
+    charging = update.binary_entity_values[DeviceKey("probe_charging")]
+    assert charging.native_value is True
 
 
 @pytest.mark.asyncio

@@ -1118,24 +1118,15 @@ class INKBIRDBluetoothDeviceData(BluetoothData):
         readings, so its freshness is irrelevant; the gate is instead the time
         since the last successful poll (``last_poll`` is the number of seconds
         since the last poll, or ``None`` if the device has never been polled).
+        The INT-11I-B uses the same gate: its advertisements carry temperature
+        and batteries, but probe charging (``ff03``) is only readable over GATT.
         """
         if not self._supports_polling:
             poll_needed = False
-        elif self._device_type is Model.INT_11I_B:
-            readings = None
-            manufacturer_data = self._int_11i_b_manufacturer_data(service_info)
-            if manufacturer_data and (service_info.raw or len(manufacturer_data) == 1):
-                manufacturer_id = list(manufacturer_data)[-1]
-                data = (
-                    manufacturer_id.to_bytes(2, "little")
-                    + manufacturer_data[manufacturer_id]
-                )
-                readings = self._decode_int_11i_b_advertisement(data)
-            poll_needed = (last_poll is None or last_poll > MIN_POLL_INTERVAL) and (
-                readings is None
-                or monotonic_time_coarse() - service_info.time > MIN_POLL_INTERVAL
-            )
-        elif self._device_type in GATT_POLL_MODELS:
+        elif (
+            self._device_type in GATT_POLL_MODELS
+            or self._device_type is Model.INT_11I_B
+        ):
             poll_needed = last_poll is None or last_poll > MIN_POLL_INTERVAL
         else:
             poll_needed = (
@@ -1211,7 +1202,7 @@ class INKBIRDBluetoothDeviceData(BluetoothData):
         payload = bytes(temperature[:2]) + bytes(battery[:2])
         if len(payload) < INT_11I_B_FULL_READ_LEN:
             return payload
-        status = b""
+        status: bytes | bytearray = b""
         status_char = service.get_characteristic(INT_11I_B_STATUS_CHARACTERISTIC_UUID)
         if status_char is not None:
             status = await client.read_gatt_char(status_char)
@@ -1243,7 +1234,9 @@ class INKBIRDBluetoothDeviceData(BluetoothData):
             self._device_type is Model.INT_11I_B
             and self._int_11i_b_advertisement_updates != advertisement_updates
         ):
-            # A newer advertisement supersedes the readings from this connection.
+            # A newer advertisement supersedes the readings from this connection,
+            # but advertisements carry no charging state, so keep that.
+            self._update_int_11i_b_charging(payload)
             return self._finish_update()
         if self._device_type in EIGHTEEN_BYTE_SENSOR_MODELS:
             if not self._poll_read_too_short(payload, EIGHTEEN_BYTE_POLL_MIN_READ_LEN):
@@ -1527,12 +1520,11 @@ class INKBIRDBluetoothDeviceData(BluetoothData):
     def _int_11i_b_manufacturer_data(
         self, service_info: BluetoothServiceInfoBleak
     ) -> dict[int, bytes]:
-        """Select INT-11I-B data without replaying cached entries for raw packets."""
-        manufacturer_data = service_info.manufacturer_data
-        if service_info.raw:
-            _, _, _, manufacturer_data, _ = parse_advertisement_data_bytes(
-                service_info.raw
-            )
+        """Select INT-11I-B data without replaying cached entries for raw packets.
+
+        Only called when ``service_info.raw`` is present.
+        """
+        _, _, _, manufacturer_data, _ = parse_advertisement_data_bytes(service_info.raw)
         if len(service_info.manufacturer_data) > 1:
             return {
                 key: value
@@ -1623,6 +1615,10 @@ class INKBIRDBluetoothDeviceData(BluetoothData):
             payload[INT_11I_B_STATION_BATTERY_INDEX],
             payload[INT_11I_B_PROBE_BATTERY_INDEX],
         )
+        self._update_int_11i_b_charging(payload)
+
+    def _update_int_11i_b_charging(self, payload: bytes) -> None:
+        """Update probe charging from the ff03 status byte of a GATT read."""
         if len(payload) > INT_11I_B_STATUS_INDEX:
             self.update_predefined_binary_sensor(
                 BinarySensorDeviceClass.BATTERY_CHARGING,

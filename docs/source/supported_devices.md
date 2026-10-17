@@ -38,8 +38,8 @@ must supply it (notify-only devices).
 - **GATT poll** — the device exposes a readable characteristic; call
   `async_poll(ble_device)` when `poll_needed()` returns true. `INT-11P-B`
   carries _no_ readings in its advertisement, so it must be polled.
-  `INT-11I-B` advertises whole-degree Celsius readings and uses polling as
-  a fallback when advertisements lack usable readings or become stale.
+  `INT-11I-B` advertises whole-degree Celsius readings but is still polled
+  on the same interval, as probe charging is only readable over GATT.
 - **GATT notify** — the device pushes readings over a notify characteristic;
   call `async_start(service_info, ble_device)` to subscribe. `IAM-T1` and
   `IHT-2PB` use this transport. `IHT-2PB` additionally requires two
@@ -50,14 +50,17 @@ must supply it (notify-only devices).
 
 ### INT-11I-B readings
 
-Advertisements provide whole-degree Celsius temperatures; GATT fallback reports
+Advertisements provide whole-degree Celsius temperatures; GATT polls report
 temperature rounded to one decimal place. Both transports update the same
 temperature, station battery, and probe battery sensors. The `0x7FFE` inactive
 probe marker clears temperature to `None` without clearing the battery readings.
 A usable advertisement received during a GATT poll takes precedence over that
-poll's response.
+poll's temperature and battery readings.
 Probe charging is only available over GATT: bit 1 of `ff03` byte 0 is set
 while the probe sits in its cradle, where it charges from the base station.
+So the probe is polled every 330 seconds whether or not its advertisements are
+usable, and the charging state from a poll is kept even when an advertisement
+supersedes the poll's other readings.
 
 The advertisement layout is based on captures while warming and docking a probe,
 with the unequal battery levels checked against the INKBIRD app. Offsets below
@@ -71,10 +74,8 @@ manufacturer payload returned by Bleak:
 | 15          | Station battery   | Percentage, 0–100                              |
 
 The decoder accepts the probe's specified [−10 to 100°C measurement range][int-11i-b-specs]
-and the inactive marker. Other bytes remain uninterpreted. Missing, malformed,
-ambiguous, or stale advertisement readings leave GATT fallback available, with
-the existing 330-second minimum interval between successful polls. The GATT
-format is different: `ff01` uses Fahrenheit hundredths and `2a19` lists station
+and the inactive marker. Other bytes remain uninterpreted; missing, malformed,
+or ambiguous advertisements publish no readings. The GATT format is different: `ff01` uses Fahrenheit hundredths and `2a19` lists station
 battery before probe battery.
 
 ## Not supported
